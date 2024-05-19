@@ -166,10 +166,17 @@ class QueryResultListResource(BaseResource):
         if max_age is None:
             max_age = -1
         max_age = int(max_age)
-        query_id = params.get("query_id", "adhoc")
+
+        if query_id := params.get("query_id"):
+            query_obj = models.Query.get_by_id(query_id)
+            schema = query_obj.parameters if query_obj else None
+        else:
+            query_id = "adhoc"
+            schema = None
+
         parameters = params.get("parameters", collect_parameters_from_request(request.args))
 
-        parameterized_query = ParameterizedQuery(query, org=self.current_org)
+        parameterized_query = ParameterizedQuery(query, schema, org=self.current_org)
         should_apply_auto_limit = params.get("apply_auto_limit", False)
 
         data_source_id = params.get("data_source_id")
