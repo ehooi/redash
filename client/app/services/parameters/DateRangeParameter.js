@@ -232,11 +232,6 @@ class DateRangeParameter extends Parameter {
   }
 
   getExecutionValue() {
-    if (this.hasDynamicValue) {
-      const format = date => date.format(DATETIME_FORMATS[this.type]);
-      const [start, end] = this.normalizedValue.value().map(format);
-      return { start, end };
-    }
     return this.value;
   }
 

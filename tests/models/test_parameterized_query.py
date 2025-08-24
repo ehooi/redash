@@ -1,9 +1,11 @@
+import datetime
 from collections import namedtuple
 from unittest import TestCase
 
 import pytest
 from mock import patch
 
+import redash.models.parameterized_query
 from redash.models.parameterized_query import (
     InvalidParameterError,
     ParameterizedQuery,
@@ -241,6 +243,16 @@ class TestParameterizedQuery(TestCase):
         query.apply({"bar": {"start": "2000-01-01 12:00:00", "end": "2000-12-31 12:00:00"}})
 
         self.assertEqual("foo 2000-01-01 12:00:00 2000-12-31 12:00:00", query.text)
+
+    @patch(f"{redash.models.parameterized_query.__name__}.date", wraps=datetime.date)
+    def test_validates_date_range_dynamic_parameters(self, mock_date):
+        schema = [{"name": "bar", "type": "date-range"}]
+        query = ParameterizedQuery("foo {{bar.start}} {{bar.end}}", schema)
+
+        mock_date.today.return_value = datetime.date(2024, 5, 8)
+        query.apply({"bar": "d_this_week"})
+
+        self.assertEqual("foo 2024-05-05 2024-05-08", query.text)
 
     def test_raises_on_unexpected_param_types(self):
         schema = [{"name": "bar", "type": "burrito"}]
