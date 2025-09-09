@@ -82,9 +82,6 @@ class DateParameter extends Parameter {
   }
 
   getExecutionValue() {
-    if (this.hasDynamicValue) {
-      return this.normalizedValue.value().format(DATETIME_FORMATS[this.type]);
-    }
     if (isNull(this.value) && this.useCurrentDateTime) {
       return moment().format(DATETIME_FORMATS[this.type]);
     }
