@@ -1,4 +1,5 @@
 import re
+from datetime import date, datetime, timedelta
 from functools import partial
 from numbers import Number
 
@@ -36,19 +37,35 @@ def dropdown_values(query_id, org):
     return list(map(pluck, data["rows"]))
 
 
-def join_parameter_list_values(parameters, schema):
+def resolve_parameters(parameters, schema):
     updated_parameters = {}
     for key, value in parameters.items():
+        definition = next((definition for definition in schema if definition["name"] == key), {})
+
         if isinstance(value, list):
-            definition = next((definition for definition in schema if definition["name"] == key), {})
-            multi_values_options = definition.get("multiValuesOptions", {})
-            separator = str(multi_values_options.get("separator", ","))
-            prefix = str(multi_values_options.get("prefix", ""))
-            suffix = str(multi_values_options.get("suffix", ""))
-            updated_parameters[key] = separator.join([prefix + v + suffix for v in value])
-        else:
-            updated_parameters[key] = value
+            updated_parameters[key] = join_parameter_list_values(definition, value)
+            continue
+
+        if isinstance(value, str) and value.startswith("d_"):
+            param_type = definition.get("type")
+            if param_type in ["date", "datetime-local", "datetime-with-seconds"]:
+                updated_parameters[key] = _make_dynamic_date(param_type, value)
+                continue
+            elif param_type in ["date-range", "datetime-range", "datetime-range-with-seconds"]:
+                updated_parameters[key] = _make_dynamic_date_range(param_type, value)
+                continue
+
+        updated_parameters[key] = value
+
     return updated_parameters
+
+
+def join_parameter_list_values(definition, value):
+    multi_values_options = definition.get("multiValuesOptions", {})
+    separator = str(multi_values_options.get("separator", ","))
+    prefix = str(multi_values_options.get("prefix", ""))
+    suffix = str(multi_values_options.get("suffix", ""))
+    return separator.join([prefix + v + suffix for v in value])
 
 
 def _collect_key_names(nodes):
@@ -100,12 +117,88 @@ def _is_regex_pattern(value, regex):
 
 
 def _is_date(string):
+    if string.startswith("d_"):
+        return True
     parse(string)
     return True
 
 
 def _is_date_range(obj):
+    if isinstance(obj, str) and obj.startswith("d_"):
+        return True
     return _is_date(obj["start"]) and _is_date(obj["end"])
+
+
+def _make_dynamic_date(param_type, value):
+    fmt = {
+        "date": "%Y-%m-%d",
+        "datetime-local": "%Y-%m-%d %H:%M",
+        "datetime-with-seconds": "%Y-%m-%d %H:%M:%S",
+    }.get(param_type)
+    if not fmt:
+        raise InvalidParameterError(value)
+
+    now = datetime.now()
+    if value == "d_now":
+        return now.strftime(fmt)
+    if value == "d_yesterday":
+        return (now - timedelta(days=1)).strftime(fmt)
+    raise InvalidParameterError(value)
+
+
+def _last_n_days(n_days):
+    return lambda today, now: (today - timedelta(days=n_days), now)
+
+
+def _last_week(today, _):
+    last_week_start = today - timedelta(days=today.isoweekday() % 7 + 7)
+    return last_week_start, last_week_start + timedelta(days=6)
+
+
+def _last_month(today, _):
+    last_month_end = today - timedelta(days=today.day())
+    return last_month_end.replace(day=1), last_month_end
+
+
+def _last_year(today, _):
+    last_year = today.year() - 1
+    return date(last_year, 1, 1), date(last_year, 12, 31)
+
+
+_dynamic_date_range = {
+    "d_today": _last_n_days(1),
+    "d_yesterday": lambda today, _: (today - timedelta(days=1), today - timedelta(days=1)),
+    "d_this_week": lambda today, now: (today - timedelta(days=today.isoweekday() % 7), now),
+    "d_this_month": lambda today, now: (today.replace(day=1), now),
+    "d_this_year": lambda today, now: (today.replace(month=1, day=1), now),
+    "d_last_week": _last_week,
+    "d_last_month": _last_month,
+    "d_last_year": _last_year,
+    "d_last_7_days": _last_n_days(7),
+    "d_last_14_days": _last_n_days(14),
+    "d_last_30_days": _last_n_days(30),
+    "d_last_60_days": _last_n_days(60),
+    "d_last_90_days": _last_n_days(90),
+    "d_last_12_months": lambda today, now: (today.replace(today.year() - 1) + timedelta(days=1), now),
+}
+
+
+def _make_dynamic_date_range(param_type, value):
+    func = _dynamic_date_range.get(value)
+    if not func:
+        raise InvalidParameterError(value)
+
+    start, end = func(date.today(), datetime.now())
+
+    fmt = {
+        "date-range": "%Y-%m-%d",
+        "datetime-range": "%Y-%m-%d %H:%M",
+        "datetime-range-with-seconds": "%Y-%m-%d %H:%M:%S",
+    }.get(param_type)
+    if not fmt:
+        raise InvalidParameterError(value)
+
+    return {"start": start.strftime(fmt), "end": end.strftime(fmt)}
 
 
 def _is_value_within_options(value, dropdown_options, allow_list=False):
@@ -121,6 +214,7 @@ class ParameterizedQuery:
         self.template = template
         self.query = template
         self.parameters = {}
+        self.resolved_params = {}
 
     def apply(self, parameters):
         invalid_parameter_names = [key for (key, value) in parameters.items() if not self._valid(key, value)]
@@ -128,7 +222,8 @@ class ParameterizedQuery:
             raise InvalidParameterError(invalid_parameter_names)
         else:
             self.parameters.update(parameters)
-            self.query = mustache_render(self.template, join_parameter_list_values(parameters, self.schema))
+            self.resolved_params = resolve_parameters(parameters, self.schema)
+            self.query = mustache_render(self.template, self.resolved_params)
 
         return self
 
@@ -189,7 +284,11 @@ class ParameterizedQuery:
     @property
     def missing_params(self):
         query_parameters = set(_collect_query_parameters(self.template))
-        return set(query_parameters) - set(_parameter_names(self.parameters))
+        return (
+            set(query_parameters)
+            - set(_parameter_names(self.parameters))
+            - set(_parameter_names(self.resolved_params))
+        )
 
     @property
     def text(self):
